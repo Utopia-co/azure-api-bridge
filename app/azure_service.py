@@ -1,73 +1,60 @@
-import os
-import threading
-import queue
-from typing import Generator
 from openai import AzureOpenAI
-from openai import AssistantEventHandler
-from .db.dynamo import DynamoDBManager
+import os
+import time
+from IPython.display import clear_output
 
-# Runner que interage com o Azure e DynamoDB
-class AzureThreadedAssistantRunner:
-    def __init__(self, assistant_id: str, table_name: str):
+class AzureAssistant:
+    def __init__(self, assistant_id: str):
         self.client = AzureOpenAI(
-            api_key=os.getenv("AZURE_OPENAI_API_KEY"),
-            api_version="2024-08-01-preview",
-            azure_endpoint=os.getenv("AZURE_OPENAI_ENDPOINT")
+            api_key=os.getenv("AZURE_OPENAI_API_KEY"),  
+            api_version="2024-05-01-preview",
+            azure_endpoint = os.getenv("AZURE_OPENAI_ENDPOINT")
         )
         self.assistant_id = assistant_id
-        self.dynamo_manager = DynamoDBManager(table_name)
 
-    def stream_azure_response(self, conversation_id: str, user_input: str) -> Generator[str, None, None]:
-        # Armazena a mensagem do usuário
-        self.dynamo_manager.insert_message(
-            conversation_id=conversation_id,
-            role="user",
-            content=user_input
+    def create_thread(self):
+        return self.client.beta.threads.create()
+    
+    def add_msg(self, thread_id, content, role='user'):
+        return self.client.beta.threads.messages.create(
+            thread_id=thread_id,
+            role=role,
+            content=content
         )
-
-        # Cria uma thread no Azure
-        thread = self.client.beta.threads.create()
-
-        # Adiciona a mensagem do usuário ao Azure
-        self.client.beta.threads.messages.create(
-            thread_id=thread.id,
-            role="user",
-            content=user_input
+    
+    def run_thread(self, thread_id, model="gpt-4o"):
+        return self.client.beta.threads.runs.create(
+            thread_id=thread_id,
+            assistant_id=self.assistant_id,
+            model=model
         )
+    
+    def handler(self, content: str, thread_id=None):
 
-        # Cria fila para receber os deltas
-        q = queue.Queue()
+        if not thread_id:
+            thread = self.create_thread()
+            thread_id = thread.id
 
-        # Handler para armazenar saídas
-        class MyEventHandler(AssistantEventHandler):
-            def on_text_delta(self, delta, snapshot):
-                if delta.value:
-                    q.put(delta.value)
-                    self.dynamo_manager.insert_message(
-                        conversation_id=conversation_id,
-                        role="assistant",
-                        content=delta.value
-                    )
+        self.add_msg(thread_id=thread_id, content=content)
+        run = self.run_thread(thread_id=thread_id)
 
-        handler = MyEventHandler()
+        start_time = time.time()
+        status = run.status
 
-        # Função de streaming
-        def run_stream():
-            with self.client.beta.threads.runs.stream(
-                thread_id=thread.id,
-                assistant_id=self.assistant_id,
-                event_handler=handler
-            ) as stream:
-                stream.until_done()
-            q.put(None)  # Sinaliza fim do streaming
+        while status not in ["completed", "cancelled", "expired", "failed"]:
+            time.sleep(5)
+            run = self.client.beta.threads.runs.retrieve(thread_id=thread_id,run_id=run.id)
+            print("Elapsed time: {} minutes {} seconds".format(int((time.time() - start_time) // 60), int((time.time() - start_time) % 60)))
+            status = run.status
+            print(f'Status: {status}')
+            clear_output(wait=True)
 
-        # Inicia o streaming
-        t = threading.Thread(target=run_stream, daemon=True)
-        t.start()
-
-        # Consome e exibe mensagens
-        while True:
-            chunk = q.get()
-            if chunk is None:
-                break
-            yield chunk
+        messages = self.client.beta.threads.messages.list(
+            thread_id=thread.id
+            )
+        return messages.data[0].model_dump_json(indent=2)
+    
+if __name__ == "__main__":
+    client = AzureAssistant("asst_jLLqOWF2RxzMu967s7nQngFs")
+    x = client.handler("Explique aprendizado profundo de maneira simples.")
+    print(x)
